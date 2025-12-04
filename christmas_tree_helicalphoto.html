@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Grand Luxury Tree Final v4 - Spiral Edition</title>
+    <title>Grand Luxury Tree Final v4 - Star Edition</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #000000; font-family: 'Times New Roman', serif; }
         #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
@@ -520,12 +520,40 @@
                 particleSystem.push(new Particle(mesh, type, false));
             }
 
-            const starGeo = new THREE.OctahedronGeometry(1.2, 0);
+            // --- 五角星生成逻辑 (Star Generation) ---
+            const starShape = new THREE.Shape();
+            const points = 5;
+            const outerRadius = 1.5;
+            const innerRadius = 0.7; // 调整内径以获得完美的五角星形状
+            
+            for (let i = 0; i < points * 2; i++) {
+                // 计算角度，+PI/2 确保一个角朝上
+                const angle = (i * Math.PI) / points + Math.PI / 2;
+                const r = (i % 2 === 0) ? outerRadius : innerRadius;
+                const x = Math.cos(angle) * r;
+                const y = Math.sin(angle) * r;
+                if (i === 0) starShape.moveTo(x, y);
+                else starShape.lineTo(x, y);
+            }
+            starShape.closePath();
+
+            // 使用 ExtrudeGeometry 创建有厚度的3D五角星
+            const starGeo = new THREE.ExtrudeGeometry(starShape, {
+                depth: 0.4,
+                bevelEnabled: true,
+                bevelThickness: 0.1,
+                bevelSize: 0.1,
+                bevelSegments: 2
+            });
+            starGeo.center(); // 居中几何体
+
             const starMat = new THREE.MeshStandardMaterial({
                 color: 0xffdd88, emissive: 0xffaa00, emissiveIntensity: 1.0,
                 metalness: 1.0, roughness: 0
             });
             const star = new THREE.Mesh(starGeo, starMat);
+            
+            // 放置在树顶
             star.position.set(0, CONFIG.particles.treeHeight/2 + 1.2, 0);
             mainGroup.add(star);
             
