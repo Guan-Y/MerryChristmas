@@ -278,7 +278,8 @@
             focusTarget: null,
             hand: { detected: false, x: 0, y: 0 },
             rotation: { x: 0, y: 0 },
-            touch: { active: false, startX: 0, startY: 0, lastX: 0, lastY: 0 }
+            touch: { active: false, startX: 0, startY: 0, lastX: 0, lastY: 0 },
+            lastGestureTime: 0
         };
 
         let scene, camera, renderer, composer;
@@ -337,49 +338,97 @@
         function setupTouchAndClick() {
             const container = document.getElementById('canvas-container');
             
-            container.addEventListener('pointerdown', (e) => {
+            // 支持触摸和鼠标事件
+            const startHandler = (e) => {
+                e.preventDefault();
                 STATE.touch.active = true;
-                STATE.touch.startX = e.clientX;
-                STATE.touch.startY = e.clientY;
-                STATE.touch.lastX = e.clientX;
-                STATE.touch.lastY = e.clientY;
-            });
+                const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+                const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+                STATE.touch.startX = clientX;
+                STATE.touch.startY = clientY;
+                STATE.touch.lastX = clientX;
+                STATE.touch.lastY = clientY;
+                STATE.touch.startTime = performance.now();
+            };
 
-            window.addEventListener('pointermove', (e) => {
+            const moveHandler = (e) => {
                 if (!STATE.touch.active) return;
-                const deltaX = e.clientX - STATE.touch.lastX;
-                const deltaY = e.clientY - STATE.touch.lastY;
-                STATE.rotation.y += deltaX * 0.005;
-                STATE.rotation.x += deltaY * 0.002;
+                e.preventDefault();
+                const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+                const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+                const deltaX = clientX - STATE.touch.lastX;
+                const deltaY = clientY - STATE.touch.lastY;
+                
+                // 移动设备上增加旋转灵敏度
+                const sensitivity = window.innerWidth < 768 ? 0.008 : 0.005;
+                STATE.rotation.y += deltaX * sensitivity;
+                STATE.rotation.x += deltaY * sensitivity * 0.4; // 垂直旋转减慢
                 STATE.rotation.x = Math.max(-0.5, Math.min(0.5, STATE.rotation.x));
-                STATE.touch.lastX = e.clientX;
-                STATE.touch.lastY = e.clientY;
-            });
+                STATE.touch.lastX = clientX;
+                STATE.touch.lastY = clientY;
+            };
 
-            window.addEventListener('pointerup', (e) => {
+            const endHandler = (e) => {
                 STATE.touch.active = false;
-            });
+            };
+
+            // 注册触摸事件
+            container.addEventListener('touchstart', startHandler, { passive: false });
+            container.addEventListener('touchmove', moveHandler, { passive: false });
+            container.addEventListener('touchend', endHandler);
+            
+            // 注册鼠标事件（用于桌面测试）
+            container.addEventListener('pointerdown', startHandler);
+            window.addEventListener('pointermove', moveHandler);
+            window.addEventListener('pointerup', endHandler);
 
             container.addEventListener('click', (e) => {
                 const moveDist = Math.hypot(e.clientX - STATE.touch.startX, e.clientY - STATE.touch.startY);
-                if (moveDist > 10) return; 
+                if (moveDist > 15) return; // 增加移动容差
 
                 mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
                 mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
                 raycaster.setFromCamera(mouse, camera);
 
+                // 扩大检测范围，提高照片点击准确度
+                raycaster.params.Points.threshold = 0.5;
+                raycaster.params.Line.threshold = 0.5;
+
                 const intersects = raycaster.intersectObjects(mainGroup.children, true);
 
                 let clickedPhoto = null;
+                let closestDistance = Infinity;
+                
+                // 找到最近的照片
                 for (let hit of intersects) {
                     let obj = hit.object;
                     while(obj.parent && obj.parent !== mainGroup && obj.parent !== photoMeshGroup) {
                         obj = obj.parent;
                     }
                     const particle = particleSystem.find(p => p.mesh === obj && p.type === 'PHOTO');
-                    if (particle) {
+                    if (particle && hit.distance < closestDistance) {
                         clickedPhoto = particle;
-                        break;
+                        closestDistance = hit.distance;
+                    }
+                }
+
+                // 如果没有直接点击到照片，检查是否点击了照片附近
+                if (!clickedPhoto) {
+                    const photos = particleSystem.filter(p => p.type === 'PHOTO');
+                    for (let photo of photos) {
+                        const photoPos = photo.mesh.position.clone();
+                        photoPos.applyMatrix4(mainGroup.matrixWorld);
+                        photoPos.project(camera);
+                        
+                        const screenX = (photoPos.x * 0.5 + 0.5) * window.innerWidth;
+                        const screenY = (-photoPos.y * 0.5 + 0.5) * window.innerHeight;
+                        const distance = Math.hypot(screenX - e.clientX, screenY - e.clientY);
+                        
+                        // 增加点击区域
+                        if (distance < 50) { // 50像素的点击区域
+                            clickedPhoto = photo;
+                            break;
+                        }
                     }
                 }
 
@@ -605,13 +654,28 @@
             const count = photos.length;
             if (count === 0) return;
             const h = CONFIG.particles.treeHeight * 0.9;
-            const bottomY = -h/2; const stepY = h / count; const loops = 3;
+            const bottomY = -h/2; 
+            const stepY = h / Math.max(count, 8); // 确保照片分布均匀
+            const loops = 2; // 减少螺旋圈数，让照片更分散
+            
             photos.forEach((p, i) => {
-                const y = bottomY + stepY * i + stepY/2;
-                const normalizedH = (y + h/2) / CONFIG.particles.treeHeight; 
-                const r = Math.max(1.0, CONFIG.particles.treeRadius * (1.0 - normalizedH)) + 3.0; 
-                const angle = normalizedH * Math.PI * 2 * loops + (Math.PI/4); 
-                p.posTree.set(Math.cos(angle) * r, y, Math.sin(angle) * r);
+                // 添加随机偏移，让照片分布更自然
+                const randomOffset = (Math.random() - 0.5) * stepY * 0.3;
+                const y = bottomY + stepY * i + stepY/2 + randomOffset;
+                
+                // 确保照片在树的高度范围内
+                const clampedY = Math.max(-h/2 + 1, Math.min(h/2 - 1, y));
+                const normalizedH = (clampedY + h/2) / CONFIG.particles.treeHeight; 
+                
+                // 增大半径，让照片更远离树中心，更加突出
+                const baseRadius = CONFIG.particles.treeRadius * (1.0 - normalizedH * 0.7);
+                const r = Math.max(2.5, baseRadius + 4.0); 
+                
+                // 添加随机角度偏移
+                const angleOffset = (Math.random() - 0.5) * Math.PI * 0.3;
+                const angle = normalizedH * Math.PI * 2 * loops + (Math.PI/4) + angleOffset + i * 0.5; 
+                
+                p.posTree.set(Math.cos(angle) * r, clampedY, Math.sin(angle) * r);
             });
         }
 
@@ -674,22 +738,50 @@
         }
 
         function addPhotoToScene(texture) {
-            const frameGeo = new THREE.BoxGeometry(1.4, 1.4, 0.05);
-            const frameMat = new THREE.MeshStandardMaterial({ color: CONFIG.colors.champagneGold, metalness: 1.0, roughness: 0.1 });
+            // 增大相框尺寸
+            const frameGeo = new THREE.BoxGeometry(1.8, 1.8, 0.08);
+            const frameMat = new THREE.MeshStandardMaterial({ 
+                color: CONFIG.colors.champagneGold, 
+                metalness: 1.0, 
+                roughness: 0.1,
+                emissive: CONFIG.colors.champagneGold,
+                emissiveIntensity: 0.2 // 添加微弱发光
+            });
             const frame = new THREE.Mesh(frameGeo, frameMat);
-            let width = 1.2; let height = 1.2;
+            
+            let width = 1.6; let height = 1.6; // 增大照片尺寸
             if (texture.image) {
                 const aspect = texture.image.width / texture.image.height;
                 if (aspect > 1) height = width / aspect; else width = height * aspect;
             }
             const photoGeo = new THREE.PlaneGeometry(width, height);
-            const photoMat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+            const photoMat = new THREE.MeshBasicMaterial({ 
+                map: texture, 
+                side: THREE.DoubleSide,
+                toneMapped: false // 保持照片原始颜色
+            });
             const photo = new THREE.Mesh(photoGeo, photoMat);
-            photo.position.z = 0.04;
+            photo.position.z = 0.06; // 稍微前移照片
+            
+            // 添加发光效果
+            const glowGeo = new THREE.PlaneGeometry(width * 1.1, height * 1.1);
+            const glowMat = new THREE.MeshBasicMaterial({
+                color: 0xffdd88,
+                transparent: true,
+                opacity: 0.3,
+                side: THREE.BackSide
+            });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            glow.position.z = -0.02;
+            
             const group = new THREE.Group();
-            group.add(frame); group.add(photo);
-            frame.scale.set(width/1.2, height/1.2, 1);
-            const s = 0.8; group.scale.set(s,s,s);
+            group.add(frame); 
+            group.add(photo);
+            group.add(glow); // 添加发光层
+            frame.scale.set(width/1.8, height/1.8, 1);
+            
+            const s = 1.0; // 增大整体尺寸
+            group.scale.set(s,s,s);
             photoMeshGroup.add(group);
             particleSystem.push(new Particle(group, 'PHOTO', false));
             updatePhotoLayout();
@@ -814,21 +906,46 @@
                 const wrist = lm[0]; const middleMCP = lm[9]; 
                 const handSize = Math.hypot(middleMCP.x - wrist.x, middleMCP.y - wrist.y);
                 if (handSize < 0.02) return;
-                const tips = [lm[8], lm[12], lm[16], lm[20]];
-                let avgTipDist = 0; tips.forEach(t => avgTipDist += Math.hypot(t.x - wrist.x, t.y - wrist.y)); avgTipDist /= 4;
-                const pinchDist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
-                const extensionRatio = avgTipDist / handSize; const pinchRatio = pinchDist / handSize;
                 
-                debugInfo.innerText = `Gesture Detected: ${STATE.mode}`;
+                // 计算手指伸展程度
+                const tips = [lm[8], lm[12], lm[16], lm[20]];
+                let avgTipDist = 0; 
+                tips.forEach(t => avgTipDist += Math.hypot(t.x - wrist.x, t.y - wrist.y)); 
+                avgTipDist /= 4;
+                
+                // 计算拇指和食指的捏合距离
+                const pinchDist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+                const extensionRatio = avgTipDist / handSize; 
+                const pinchRatio = pinchDist / handSize;
+                
+                // 添加稳定性检查，避免频繁切换
+                const now = performance.now();
+                if (!STATE.lastGestureTime) STATE.lastGestureTime = 0;
+                if (now - STATE.lastGestureTime < 500) return; // 500ms内不重复识别
+                STATE.lastGestureTime = now;
+                
+                debugInfo.innerText = `手势: ${STATE.mode === 'TREE' ? '树形' : STATE.mode === 'SCATTER' ? '散落' : '聚焦'}`;
 
-                if (extensionRatio < 1.5) { STATE.mode = 'TREE'; STATE.focusTarget = null; }
-                else if (pinchRatio < 0.35) {
+                // 调整手势阈值，让控制更准确
+                if (extensionRatio < 1.3) { // 握拳 - 树形模式
+                    if (STATE.mode !== 'TREE') {
+                        STATE.mode = 'TREE'; 
+                        STATE.focusTarget = null;
+                    }
+                }
+                else if (pinchRatio < 0.3 && extensionRatio > 1.2) { // 捏合手势 - 聚焦模式
                     if (STATE.mode !== 'FOCUS') {
                         STATE.mode = 'FOCUS';
                         const photos = particleSystem.filter(p => p.type === 'PHOTO');
                         if (photos.length) STATE.focusTarget = photos[Math.floor(Math.random()*photos.length)].mesh;
                     }
-                } else if (extensionRatio > 1.7) { STATE.mode = 'SCATTER'; STATE.focusTarget = null; }
+                } 
+                else if (extensionRatio > 1.5) { // 张开手掌 - 散落模式
+                    if (STATE.mode !== 'SCATTER') {
+                        STATE.mode = 'SCATTER'; 
+                        STATE.focusTarget = null;
+                    }
+                }
             } else {
                 STATE.hand.detected = false;
             }
